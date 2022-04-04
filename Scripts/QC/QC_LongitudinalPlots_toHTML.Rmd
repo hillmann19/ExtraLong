@@ -1,0 +1,885 @@
+---
+title: "QC Longitudinal Plots"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r,include=FALSE}
+# Read in the data and necessary packages
+library(tidyverse)
+library(VIM)
+library(ggrepel)
+library(gridExtra)
+library(readr)
+library(kableExtra)
+library(mosaic)
+library(gtsummary)
+library(ggpubr)
+library(plotly)
+library(scales)
+library(gganimate)
+asegLong.df <- read_delim("~/Projects/ExtraLong/Data/freesurferLongitudinal_aseg.table.txt", 
+                          delim = "\t", escape_double = FALSE, 
+                          trim_ws = TRUE)
+asegCross.df <- read.delim("~/Projects/ExtraLong/Data/freesurferCrossSectional_aseg.table.txt")
+ScanTime.df <- read_table2("~/Projects/ExtraLong/Data/qdec_table.dat")
+Exclude.df <- read_csv("~/Projects/ExtraLong/Data/antssstExclude.csv") %>% 
+  rename(Session = seslabel) %>% 
+  mutate(bblid = as.character(bblid)) %>% 
+  mutate(Session = paste("ses-",Session,sep = ""))
+QC.long <- read_table2("~/Projects/ExtraLong/Data/AllSessions_quality_cross.csv") %>% 
+  filter(if_all(.fns = ~ !is.na(.))) %>% 
+  rename(Scan.Date = Scan_Date) %>% 
+  mutate(fsid = as.character(fsid))
+QC.template <- read_csv("~/Projects/ExtraLong/Data/quality_2021-05-20.csv") %>% 
+  filter(if_all(.fns = ~ !is.na(.)))
+demo <- read_csv("~/Projects/ExtraLong/Data/scanid_to_seslabel_demo_20200531.csv") 
+demo.dict <- read_delim("~/Projects/ExtraLong/Data/demographics_dictionary_20161212.txt", 
+                        delim = "\t", escape_double = FALSE, 
+                        trim_ws = TRUE) 
+```
+
+```{r,include=FALSE}
+# Remove individuals in the quality control template data set that have less than two cross-sectional neuroimages of adequate quality. 
+Include.bblids <- Exclude.df %>% 
+  group_by(bblid) %>% 
+  summarize(n = n(),BadSessions = sum(antssstExclude)) %>% 
+  filter(n - BadSessions > 1) %>% 
+  pull(bblid)
+QC.template.included <- QC.template %>% 
+  mutate(holes_lh = as.numeric(holes_lh),holes_rh = as.numeric(holes_rh),euler_lh = as.numeric(euler_lh),euler_rh = as.numeric(euler_rh)) %>% 
+  mutate(bblid = as.character(bblid)) %>% 
+  filter(bblid %in% Include.bblids)
+```
+
+```{r,include=FALSE}
+# Fix the scan data column and rename fsid to bblid
+QC.long <- QC.long %>% 
+  mutate(Scan.Date = str_remove(Scan.Date,pattern = "T.*")) %>% 
+  mutate(Scan.Date = str_remove(Scan.Date,pattern = '"')) %>% 
+  mutate(Scan.Date = as.Date(Scan.Date)) %>% 
+  rename(bblid = fsid) 
+```
+
+```{r,include=FALSE}
+# Use the demo.dict file to relabel the demographic data set to it's non-numeric values. 
+demo <- demo %>% 
+  mutate(sex = case_when(sex == 1 ~ "Male",sex == 2 ~ "Female")) %>% 
+  mutate(race = case_when(race == 1 ~ "White",race == 2 ~ "Black",race == 3 ~ "Native American",race == 4 ~ "Asian",race == 5 ~ "More than one race",race == 6 ~ "Hawaiian/Pacific",race == 9 ~ "Unknown")) %>% 
+  mutate(ethnic = case_when(ethnic == 1 ~ "Hispanic/Latino",ethnic == 2 ~ "Not Hispanic/Latino",ethnic == 9 ~ "Unknown")) %>% 
+  rename(ethnicity = ethnic) %>% 
+  relocate(bblid,sex,race,ethnicity,seslabel) %>% 
+  rename(Session = seslabel) %>% 
+  mutate(Session = paste("ses-",Session,sep = "")) %>% 
+  mutate(bblid = as.character(bblid))
+```
+
+```{r,include=FALSE}
+# Find mislabeled subjects in the demographics data set. 
+MislabeledSubjects <- demo %>% 
+  group_by(bblid,Session) %>% 
+  summarize(n = n()) %>% 
+  filter(n > 1) %>% 
+  ungroup() %>% 
+  pull(bblid)
+```
+
+```{r,include=FALSE}
+# Correct session labels; add demographic information to QC.long data set (these are actually cross-sectional measures, should probably change name) and remove sessions that didn't pass the cross-sectional QC. 
+correctSessionLabel <- function(df){
+  subjID <- df %>% 
+    slice(1) %>% 
+    pull(bblid)
+  if(subjID %in% MislabeledSubjects){
+    mislabeledSession <- df %>% 
+      filter(Session == "ses-CONTE1") %>% 
+      arrange(timepoint) %>% 
+      mutate(Session = ifelse(timepoint == max(timepoint),"ses-CONTE2","ses-CONTE1"))
+    
+    other.df <- df %>% 
+      filter(Session != "ses-CONTE1")
+    
+    df <- rbind(mislabeledSession,other.df)
+  }
+  return(df)
+}
+
+demo.ID <- demo %>% 
+  group_split(bblid)
+demo <- map_dfr(demo.ID,correctSessionLabel)
+
+QC.long.included <- QC.long %>% 
+  left_join(demo) %>% 
+  left_join(Exclude.df) %>% 
+  filter(antssstExclude == FALSE)
+```
+
+
+```{r,include=FALSE}
+# Create plots which depict individuals who have poor templates on a variety of QC measures
+
+QC.measures <- QC.template.included %>% 
+  select(-bblid,-seslabel) %>% 
+  colnames() 
+
+names.df <- data.frame(Short.Name = c("cnr_graycsf_lh","cnr_graycsf_rh","cnr_graywhite_lh","cnr_graywhite_rh","holes_lh","holes_rh","holes_total","euler_lh","euler_rh","euler_total"),Long.Name = c("CNR Gray-CSF Left Hemisphere", "CNR Gray-CSF Right Hemisphere", "CNR Gray-White Left Hemisphere", "CNR Gray-White Right Hemisphere","Holes Left Hemisphere","Holes Right Hemisphere","Holes Total","Euler Left Hemisphere","Euler Right Hemisphere","Euler Total"))
+
+getQCplot <- function(Measure.of.Interest){
+  
+  #if we are plotting the number of holes in an image, we want to highlight extreme high values, not low values
+  if(str_detect(Measure.of.Interest,pattern = "holes")){
+    
+    Name.of.Measure <- names.df %>% 
+      filter(Short.Name == Measure.of.Interest) %>% 
+      pull(Long.Name)
+    
+    Measure.of.Interest <- quo(!!sym(Measure.of.Interest))
+    
+    QC.template.included.label <- QC.template.included %>% 
+      mutate(Z.score = (!!Measure.of.Interest - mean(!!Measure.of.Interest))/sd(!!Measure.of.Interest)) %>% 
+      filter(Z.score > 2)
+    
+    QC.template.included.bblid <- QC.template.included %>% 
+      mutate(Z.score = scale(!!Measure.of.Interest)) %>% 
+      filter(Z.score > 2) %>% 
+      pull(bblid)
+    
+    Summary.df <- QC.template.included %>% 
+      summarize(Mean = mean(!!Measure.of.Interest),SD = sd(!!Measure.of.Interest))
+    
+    Mean <- Summary.df$Mean
+    SD <- Summary.df$SD
+    
+    QC.template.included %>% 
+      mutate(LowQuality = ifelse(bblid %in% QC.template.included.bblid,"Z-Score > 2","Z-Score < 2")) %>% 
+      ggplot(aes(x = !!Measure.of.Interest,y = as.factor(bblid))) + geom_point(aes(color = LowQuality)) + scale_y_discrete(breaks = NULL,expand = expansion(add = 15)) + theme(axis.text.y = element_blank(),axis.ticks.y = element_blank(),panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black"),plot.caption = element_text(hjust = 0,size = 6)) + labs(y = "ID #",x = paste(Name.of.Measure)) + scale_color_brewer(name = "Low Quality Templates",palette = "Dark2") + geom_vline(xintercept = Mean) + geom_vline(xintercept = (Mean - 2*SD),lty = 2) + geom_vline(xintercept = (Mean + 2*SD),lty = 2) + geom_label_repel(data = QC.template.included.label,aes(label=bblid),max.overlaps = getOption("ggrepel.max.overlaps", default = Inf))
+  } else{
+    
+    Name.of.Measure <- names.df %>% 
+      filter(Short.Name == !!Measure.of.Interest) %>% 
+      pull(Long.Name)
+    
+    Measure.of.Interest <- quo(!!sym(Measure.of.Interest))
+    
+    QC.template.included.label <- QC.template.included %>% 
+      mutate(Z.score = (!!Measure.of.Interest-mean(!!Measure.of.Interest))/sd(!!Measure.of.Interest)) %>% 
+      filter(Z.score < -2)
+    
+    QC.template.included.bblid <- QC.template.included %>% 
+      mutate(Z.score = scale(!!Measure.of.Interest)) %>% 
+      filter(Z.score < -2) %>% 
+      pull(bblid)
+    
+    Summary.df <- QC.template.included %>% 
+      summarize(Mean = mean(!!Measure.of.Interest),SD = sd(!!Measure.of.Interest))
+    
+    Mean <- Summary.df$Mean
+    SD <- Summary.df$SD
+    
+    QC.template.included %>% 
+      mutate(LowQuality = ifelse(bblid %in% QC.template.included.bblid,"Z-Score < -2","Z-Score > -2")) %>% 
+      ggplot(aes(x = !!Measure.of.Interest,y = as.factor(bblid))) + geom_point(aes(color = LowQuality)) + scale_y_discrete(breaks = NULL,expand = expansion(add = 15)) + theme(axis.text.y = element_blank(),axis.ticks.y = element_blank(),panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black"),plot.caption = element_text(hjust = 0,size = 6)) + labs(y = "ID #",x = paste(Name.of.Measure)) + scale_color_brewer(name = "Low Quality Templates",palette = "Dark2") + geom_vline(xintercept = Mean) + geom_vline(xintercept = (Mean - 2*SD),lty = 2) + geom_vline(xintercept = (Mean + 2*SD),lty = 2)  + geom_label_repel(data = QC.template.included.label,aes(label=bblid),label.size = .1,size = 3,max.time = 1.5,max.overlaps = getOption("ggrepel.max.overlaps", default = Inf),force = 2)
+  }
+}
+
+QCplots <- map(QC.measures,getQCplot)
+```
+
+```{r,include=FALSE}
+# Create data sets which include the number of time points for each bblid, as well as the average/max time between scans for each bblid
+QC.NumTimepoints <- demo %>% 
+  distinct(bblid,.keep_all = TRUE) %>% 
+  select(bblid,num_timepoints)
+QC.timepoint <- demo %>% 
+  group_by(bblid) %>% 
+  arrange(timepoint) %>% 
+  mutate(Avg.time.between.scans = mean(diff(scanage_years))) %>% 
+  mutate(Max.time.between.scans = max(diff(scanage_years))) %>% 
+  mutate(Age.at.scans = str_c(scanage_years,sep = "",collapse = ", ")) %>% 
+  ungroup() %>% 
+  relocate(bblid:Session,Age.at.scans,Avg.time.between.scans,Max.time.between.scans) %>% 
+  select(bblid,Age.at.scans,Avg.time.between.scans,Max.time.between.scans) %>% 
+  distinct() %>% 
+  left_join(QC.NumTimepoints)
+```
+
+```{r,include=FALSE}
+# Create table which flags individuals who have poor templates on a variety of QC measures
+QC.AcrossModalityTable <- QC.template.included %>% 
+  select(-holes_lh,-holes_rh,-holes_total,-seslabel) %>% 
+  pivot_longer(cols = cnr_graycsf_lh:euler_total,names_to = "QC.measure",values_to = "QC.value") %>% 
+  group_by(QC.measure) %>% 
+  mutate(Z.score = as.vector(scale(QC.value))) %>% 
+  mutate(Poor.Quality = ifelse(Z.score < -2,1,0)) %>% 
+  ungroup() %>% 
+  group_by(bblid) %>% 
+  mutate(PoorQuality.Total = sum(Poor.Quality)) %>% 
+  ungroup() %>% 
+  select(-QC.value,-Poor.Quality) %>% 
+  pivot_wider(names_from = QC.measure,values_from = Z.score,names_glue = "Z-score:<br/>{QC.measure}") %>% 
+  arrange(desc(PoorQuality.Total)) %>%
+  filter(PoorQuality.Total >= 1) %>% 
+  left_join(QC.timepoint) %>% 
+  select(-Avg.time.between.scans,-Max.time.between.scans) %>% 
+  rename("Number of timepoints" = num_timepoints,"Age at scan" = Age.at.scans) %>% 
+  mutate(across(`Z-score:<br/>cnr_graycsf_lh`:`Z-score:<br/>euler_total`,~ cell_spec(.x,format = "html",color = ifelse(.x < -2,"red","black")))) %>% 
+  rename("Poor QC Measures <br/> (# total)" = PoorQuality.Total) %>% 
+  kbl(escape = F,format = "html") %>% 
+  kable_minimal()
+```
+
+```{r,include=FALSE}
+# Create plots which maps the relationship between having a poor template and the following variables:max/average time between scans, number of timepoints, and age at first scan
+QC.MaxTimeBetweenScans <- QC.template.included %>% 
+  select(-(holes_lh:holes_total)) %>% 
+  left_join(QC.timepoint) %>% 
+  pivot_longer(cols = cnr_graycsf_lh:euler_total,names_to = "QC.measures",values_to = "QC.values") %>% 
+  mutate(QC.measures = case_when(QC.measures == "cnr_graycsf_lh" ~ "CNR Gray-CSF Left Hemisphere",QC.measures == "cnr_graycsf_rh" ~ "CNR Gray-CSF Right Hemisphere",QC.measures == "cnr_graywhite_lh" ~ "CNR Gray-White Left Hemisphere",QC.measures == "cnr_graywhite_rh" ~ "CNR Gray-White Right Hemisphere",QC.measures == "euler_lh" ~ "Euler Left Hemisphere",QC.measures == "euler_rh" ~ "Euler Right Hemisphere",QC.measures == "euler_total" ~ "Euler Total")) %>% 
+  group_by(QC.measures) %>% 
+  mutate(QC.values.scaled = as.numeric(scale(QC.values))) %>% 
+  ungroup() %>% 
+  mutate(Quality = ifelse(QC.values.scaled < -2,"Poor (Z-score < -2)","Adequate (Z-score > -2)")) %>% 
+  filter(!(QC.measures %in% c("cnr_graycsf_lh","cnr_graycsf_rh"))) %>% 
+  ggplot(aes(x = Max.time.between.scans,color = Quality,fill = Quality)) + geom_density(alpha = .1) + scale_color_brewer(palette = "Accent") + scale_fill_brewer(palette = "Accent") + facet_wrap(~QC.measures) + labs(x = "Max time between scans (years)") + theme_minimal() + labs(fill = "Template Quality",color = "Template Quality")
+
+
+QC.AvgTimeBetweenScans <- QC.template.included %>% 
+  select(-(holes_lh:holes_total)) %>% 
+  left_join(QC.timepoint) %>% 
+  pivot_longer(cols = cnr_graycsf_lh:euler_total,names_to = "QC.measures",values_to = "QC.values") %>% 
+  group_by(QC.measures) %>% 
+  mutate(QC.values.scaled = as.numeric(scale(QC.values))) %>% 
+  mutate(Quality = ifelse(QC.values.scaled < -2,"Poor (Z-score < -2)","Adequate (Z-score > -2)")) %>% 
+  filter(!(QC.measures %in% c("cnr_graycsf_lh","cnr_graycsf_rh"))) %>%
+  mutate(QC.measures = case_when(QC.measures == "cnr_graycsf_lh" ~ "CNR Gray-CSF Left Hemisphere",QC.measures == "cnr_graycsf_rh" ~ "CNR Gray-CSF Right Hemisphere",QC.measures == "cnr_graywhite_lh" ~ "CNR Gray-White Left Hemisphere",QC.measures == "cnr_graywhite_rh" ~ "CNR Gray-White Right Hemisphere",QC.measures == "euler_lh" ~ "Euler Left Hemisphere",QC.measures == "euler_rh" ~ "Euler Right Hemisphere",QC.measures == "euler_total" ~ "Euler Total")) %>% 
+  ggplot(aes(x = Avg.time.between.scans,color = Quality,fill = Quality)) + geom_density(alpha = .1) + scale_color_brewer(palette = "Accent") + scale_fill_brewer(palette = "Accent") + facet_wrap(~QC.measures) + labs(x = "Average time between scans (years)") + theme_minimal() + labs(fill = "Template Quality",color = "Template Quality")
+
+QC.timepoints.plot <- QC.template.included %>% 
+  select(-(holes_lh:holes_total)) %>% 
+  left_join(QC.timepoint) %>% 
+  pivot_longer(cols = cnr_graycsf_lh:euler_total,names_to = "QC.measures",values_to = "QC.values") %>% 
+  group_by(QC.measures) %>% 
+  mutate(QC.values.scaled = as.numeric(scale(QC.values))) %>% 
+  mutate(Quality = ifelse(QC.values.scaled < -2,"Poor (Z-score < -2)","Adequate (Z-score > -2)")) %>% 
+  filter(!(QC.measures %in% c("cnr_graycsf_lh","cnr_graycsf_rh"))) %>%
+  mutate(QC.measures = case_when(QC.measures == "cnr_graycsf_lh" ~ "CNR Gray-CSF Left Hemisphere",QC.measures == "cnr_graycsf_rh" ~ "CNR Gray-CSF Right Hemisphere",QC.measures == "cnr_graywhite_lh" ~ "CNR Gray-White Left Hemisphere",QC.measures == "cnr_graywhite_rh" ~ "CNR Gray-White Right Hemisphere",QC.measures == "euler_lh" ~ "Euler Left Hemisphere",QC.measures == "euler_rh" ~ "Euler Right Hemisphere",QC.measures == "euler_total" ~ "Euler Total")) %>% 
+  group_by(QC.measures,Quality) %>% 
+  summarize(Mean.Timepoints = mean(num_timepoints),SD.Timepoints = sd(num_timepoints),N = n()) %>% 
+  mutate(SE.Timepoints = SD.Timepoints/sqrt(N)) %>% 
+  mutate(Quality = factor(Quality,levels = c("Poor (Z-score < -2)","Adequate (Z-score > -2)"))) %>% 
+  ggplot(aes(x = Quality,y = Mean.Timepoints,color = Quality,fill = Quality)) + geom_bar(stat = "identity",alpha = .5) + geom_errorbar(aes(ymin = Mean.Timepoints - 2*SE.Timepoints,ymax = Mean.Timepoints + 2*SE.Timepoints)) + facet_wrap(~QC.measures) + labs(x = "Template Quality",y = "Number of Timepoints (Mean +- 2*SE)",fill = "Template Quality",color = "Template Quality") + theme_minimal() + scale_color_brewer(palette = "Accent") + scale_fill_brewer(palette = "Accent")
+
+QC.age.plot <- QC.template.included %>% 
+  select(-(holes_lh:holes_total)) %>% 
+  left_join(QC.timepoint) %>% 
+  mutate(Age.first.scan = as.numeric(str_remove_all(Age.at.scans,pattern = ",.*"))) %>% 
+  pivot_longer(cols = cnr_graycsf_lh:euler_total,names_to = "QC.measures",values_to = "QC.values") %>% 
+  group_by(QC.measures) %>% 
+  mutate(QC.values.scaled = as.numeric(scale(QC.values))) %>% 
+  ungroup() %>% 
+  mutate(Quality = ifelse(QC.values.scaled < -2,"Poor (Z-score < -2)","Adequate (Z-score > -2)")) %>% 
+  filter(!(QC.measures %in% c("cnr_graycsf_lh","cnr_graycsf_rh"))) %>% 
+  mutate(QC.measures = case_when(QC.measures == "cnr_graycsf_lh" ~ "CNR Gray-CSF Left Hemisphere",QC.measures == "cnr_graycsf_rh" ~ "CNR Gray-CSF Right Hemisphere",QC.measures == "cnr_graywhite_lh" ~ "CNR Gray-White Left Hemisphere",QC.measures == "cnr_graywhite_rh" ~ "CNR Gray-White Right Hemisphere",QC.measures == "euler_lh" ~ "Euler Left Hemisphere",QC.measures == "euler_rh" ~ "Euler Right Hemisphere",QC.measures == "euler_total" ~ "Euler Total")) %>% 
+  ggplot(aes(x = Age.first.scan,color = Quality,fill = Quality)) + geom_density(alpha = .1) + scale_color_brewer(palette = "Accent") + scale_fill_brewer(palette = "Accent") + facet_wrap(~QC.measures) + labs(x = "Age at first scan (years)") + theme_minimal() + labs(fill = "Template Quality",color = "Template Quality")
+```
+
+```{r,include=FALSE}
+# Examine relationship between QC measure variation between scans and template quality
+QC.SD <- QC.long.included %>% 
+  group_by(bblid) %>% 
+  mutate(num_timepoints = n()) %>% 
+  ungroup() %>% 
+  filter(num_timepoints > 1) %>% 
+  select(!contains("holes")) %>% 
+  pivot_longer(cols = euler_lh:cnr_graywhite_rh,names_to = "QC.measures",values_to = "QC.values") %>% 
+  group_by(bblid,QC.measures) %>% 
+  summarize(SD = sd(QC.values)) %>% 
+  ungroup()
+
+QC.VariationWithinIndividual <- QC.template.included %>% 
+  select(!contains("holes")) %>% 
+  pivot_longer(cols = cnr_graycsf_lh:euler_total,names_to = "QC.measures",values_to = "QC.values") %>% 
+  left_join(QC.SD) %>% 
+  filter(!is.na(SD)) %>% 
+  group_by(QC.measures) %>% 
+  mutate(Z.values = as.numeric(scale(QC.values))) %>% 
+  ungroup() %>% 
+  mutate(Template.quality = ifelse(Z.values < -2, "Poor (Z-score < -2)","Adequate (Z-score > -2)")) %>% 
+  filter(!(QC.measures %in% c("cnr_graycsf_lh","cnr_graycsf_rh"))) %>% 
+  mutate(QC.measures = case_when(QC.measures == "cnr_graycsf_lh" ~ "CNR Gray-CSF Left Hemisphere",QC.measures == "cnr_graycsf_rh" ~ "CNR Gray-CSF Right Hemisphere",QC.measures == "cnr_graywhite_lh" ~ "CNR Gray-White Left Hemisphere",QC.measures == "cnr_graywhite_rh" ~ "CNR Gray-White Right Hemisphere",QC.measures == "euler_lh" ~ "Euler Left Hemisphere",QC.measures == "euler_rh" ~ "Euler Right Hemisphere",QC.measures == "euler_total" ~ "Euler Total")) %>% 
+  ggplot(aes(x = SD,color = Template.quality,fill = Template.quality)) + geom_density(alpha = .5) + facet_wrap(~QC.measures,scales = "free") + theme_classic() + labs(x = "Quality metric standard deviation (within individual)",fill = "Template Quality",color = "Template Quality") + scale_color_brewer(palette = "Dark2") + scale_fill_brewer(palette = "Dark2")
+```
+
+```{r,include=FALSE}
+# Fix scan data column, remove sessions which didn't pass cross-sectional QC
+asegCross <- asegCross.df %>% 
+  rename(id = Measure.volume) %>% 
+  mutate(id = str_remove(id,pattern = "\\.long.Template.*")) %>% 
+  left_join(ScanTime.df,by = c("id" = "fsid")) %>% 
+  rename(Scan.Date = `Scan-Date`) %>% 
+  relocate(id,Scan.Date) %>%
+  mutate(Scan.Date = str_remove(Scan.Date,pattern = "T.*")) %>% 
+  mutate(Scan.Date = str_remove(Scan.Date,pattern = '"')) %>% 
+  mutate(Scan.Date = as.Date(Scan.Date)) %>% 
+  separate(id, into = c("bblid","Session"),sep = "/") %>% 
+  mutate(bblid = str_remove(bblid,pattern = "sub-")) %>% 
+  left_join(Exclude.df) %>% 
+  filter(antssstExclude == FALSE)
+```
+
+```{r,include=FALSE}
+# Plot total intracranial volume over time to examine scanner consistency
+TIV.byTime <- asegCross %>% 
+  ggplot(aes(x = Scan.Date,y = EstimatedTotalIntraCranialVol,group = bblid)) + geom_point(color = "lightsteelblue") + geom_line(color = "lightsteelblue") + theme_classic() + labs(x = "Scan Date",y = "eTIV",title = "Intracranial Volume by Subject") + geom_smooth(aes(group = 1),color = "black",se = FALSE)
+```
+
+```{r,include=FALSE}
+# Write function which adds an indicator variable for if an individual's TIV decreased across all of their sessions
+eTIVdecrease <- function(df){
+  eTIVs <- df %>% 
+    arrange(Scan.Date) %>% 
+    pull(EstimatedTotalIntraCranialVol)
+  if(is.unsorted(-eTIVs)){
+    df <- df %>% 
+      mutate(TIVdecrease = "No")
+  } else{
+    df <- df %>% 
+      mutate(TIVdecrease = "Yes")
+  }
+  
+  return(df)
+}
+
+
+asegCross.ID <- asegCross %>% 
+  group_split(bblid)
+asegCross <- map_dfr(asegCross.ID,eTIVdecrease)
+```
+
+```{r,include=FALSE}
+# Plot decreasing TIV individuals and non-decreasing TIV individuals separately
+TIV.split.time <- asegCross %>% 
+    ggplot(aes(x = Scan.Date,y = EstimatedTotalIntraCranialVol,group = bblid)) + geom_point(aes(color = TIVdecrease)) + geom_line(aes(color = TIVdecrease)) + theme(axis.text.x = element_text(size = 6),panel.background = element_blank(),panel.grid.major = element_blank(),panel.grid.minor = element_blank()) + labs(x = "Scan Date",y = "eTIV",title = "Intracranial Volume by Subject") + facet_wrap(~TIVdecrease) + scale_color_brewer(palette = "Dark2") + geom_smooth(aes(group = 1),color = "black",se = FALSE) + labs(color = "TIV decrease across all sessions")
+```
+
+```{r,include=FALSE}
+# Another plot examining whether an individual's TIV differs between their first and last scan 
+TIVDiff <- function(df){
+  N <- nrow(df)
+TIVs <-  df %>% 
+    arrange(Scan.Date) %>% 
+    slice(1,N) %>% 
+    pull(EstimatedTotalIntraCranialVol)
+TIVDiff <- TIVs[2] -TIVs[1]    
+newdf <- data.frame(bblid = df$bblid[1],TIVDiffs = TIVDiff)
+return(newdf)
+}
+
+TIV_Diff.df <- map_dfr(asegCross.ID,TIVDiff)
+
+Summary.TIV <- TIV_Diff.df %>% 
+  summarize(Mean = mean(TIVDiffs),SD = sd(TIVDiffs))
+
+#TIV.Label <- TIV_Diff.df %>% 
+ # mutate(Z.score = scale(TIVDiffs)) %>% 
+ # mutate(PoorQuality = ifelse(Z.score < -2,"Poor","Adequate")) %>% 
+  #filter(PoorQuality == "Poor")
+
+TIV.LastFirst <- TIV_Diff.df %>% 
+  mutate(Z.score = scale(TIVDiffs)) %>% 
+  mutate(LargeDiff = ifelse(Z.score < -2,"Z-score < -2","Z-score > -2")) %>% 
+  ggplot(aes(x = TIVDiffs,y = bblid)) + geom_point(aes(color = LargeDiff)) + theme(axis.text.y = element_blank(),axis.ticks.y = element_blank(),panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black")) + geom_vline(data = Summary.TIV,aes(xintercept = Mean)) + geom_vline(data = Summary.TIV,aes(xintercept = Mean + 2*SD),lty = 2) + geom_vline(data = Summary.TIV,aes(xintercept = Mean - 2*SD),lty = 2) + labs(x = "Last Scan TIV - First Scan TIV",y = "Subject ID",color = "TIV difference") + scale_color_brewer(palette = "Dark2") + scale_y_discrete(breaks = NULL,expand = expansion(add = 15)) #+ geom_label_repel(data = TIV.Label,aes(label = bblid))
+```
+
+```{r,include=FALSE}
+# Scanner consistency plot: looking for drift in Euler number
+Euler.drift <- QC.long.included %>% 
+  ggplot(aes(x = Scan.Date,y = euler_total,group = bblid)) + geom_point(color = "lightgray") + geom_path(color = "lightgray") + geom_smooth(aes(group = 1),color = "black") + theme_classic() + labs(x = "Scan date",y = "Euler Total") 
+
+QC.long.included.ID <- QC.long.included %>% 
+  group_split(bblid)
+```
+
+```{r,include=FALSE}
+# Another plot examining whether an individual's euler number differs between their first and last scan 
+
+EulerDiff <- function(df){
+  N <- nrow(df)
+EulerTotals <-  df %>% 
+    arrange(Scan.Date) %>% 
+    slice(1,N) %>% 
+    pull(euler_total)
+TotalEulerDiff <- EulerTotals[2] - EulerTotals[1]    
+df <- data.frame(bblid = df$bblid[1],TotalEulerDiff = TotalEulerDiff)
+return(df)
+}
+
+EulerDiff.df <- map_dfr(QC.long.included.ID,EulerDiff)
+Euler.FirstLast <- EulerDiff.df %>% 
+  ggplot(aes(x = TotalEulerDiff)) + geom_histogram(fill = "lightsteelblue",bins = 75) + theme_classic() + labs(x = "Last scan - first scan (total euler number)")
+
+Template.LowEuler <- QC.template.included %>% 
+  mutate(euler_total_Zscore = (euler_total - mean(euler_total))/sd(euler_total)) %>% 
+  filter(euler_total_Zscore < -2) %>% 
+  arrange(desc(euler_total_Zscore)) %>% 
+  pull(bblid)
+```
+
+```{r,include=FALSE}
+# Compares the cross-sectional scan trajectory of every individual with a poor template (based on euler total) to individuals with adequate templates
+cntr <- 1
+QC.long.included.plot <- list()
+for(id in Template.LowEuler){
+  QC.long.included.plot[[cntr]] <- QC.long.included %>% 
+    mutate(ID = ifelse(bblid == id,"Poor Template ID","Adequate Template")) %>% 
+    mutate(size = ifelse(bblid == id,.75,.25)) %>% 
+    mutate(alpha = ifelse(bblid == id,1,.1)) %>% 
+    filter(!(bblid %in% Template.LowEuler) | bblid == id) %>% 
+  ggplot() + geom_point(aes(x = scanage_years,y = euler_total,group = bblid,color = ID,alpha = alpha,size = size)) +  geom_line(aes(x = scanage_years,y = euler_total,group = bblid,color = ID,alpha = alpha,size = size)) + scale_alpha_identity() + scale_size_identity() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black")) + labs(x = "",y = "") + scale_color_brewer(palette = "Dark2") 
+  cntr <- cntr + 1
+}
+
+Euler.poorTemplate <- ggarrange(plotlist = QC.long.included.plot,common.legend = TRUE,legend = "right",labels = str_c("bblid:",Template.LowEuler,sep = " "),font.label = list(size = 8),label.x = .25)
+Euler.total.split <- annotate_figure(Euler.poorTemplate,bottom = text_grob("Age"),left = text_grob("Euler Total",rot = 90))
+
+QC.Euler.all.plot <- QC.long.included %>% 
+    mutate(ID = ifelse(bblid %in% Template.LowEuler,"Poor Template","Adequate Template")) %>% 
+    mutate(alpha = ifelse(bblid %in% Template.LowEuler,1,.25)) %>% 
+    mutate(size = ifelse(bblid %in% Template.LowEuler,.75,.25)) %>% 
+  ggplot() + geom_point(aes(x = scanage_years,y = euler_total,group = bblid,color = ID,alpha = alpha,size = size)) +  geom_line(aes(x = scanage_years,y = euler_total,group = bblid,color = ID,alpha = alpha,size = size)) + scale_alpha_identity() + scale_size_identity() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black")) + labs(x = "Age",y = "Euler Total") + scale_color_brewer(palette = "Dark2") #+ geom_smooth(aes(x = scanage_years,y = euler_total,group = ID,color = ID))
+```
+
+```{r,include=FALSE}
+# Compares the cross-sectional scan trajectory of every individual with a poor template (based on CNR gray-CSF left hemisphere) to individuals with adequate templates
+Template.LowCNR.GrayCSF <- QC.template.included %>% 
+  mutate(Z.cnr_graycsf_lh = as.numeric(scale(cnr_graycsf_lh))) %>% 
+  filter(Z.cnr_graycsf_lh < -2) %>% 
+  arrange(desc(Z.cnr_graycsf_lh)) %>% 
+  pull(bblid)
+
+cntr <- 1
+CNR_GrayCSF_lh.plot <- list()
+for(id in Template.LowCNR.GrayCSF){
+  CNR_GrayCSF_lh.plot[[cntr]] <- QC.long.included %>% 
+    mutate(ID = ifelse(bblid == id,"Poor Template ID","Adequate Template")) %>% 
+    mutate(size = ifelse(bblid == id,.75,.25)) %>% 
+    mutate(alpha = ifelse(bblid == id,1,.1)) %>% 
+    filter(!(bblid %in% Template.LowCNR.GrayCSF) | bblid == id) %>% 
+  ggplot() + geom_point(aes(x = scanage_years,y = cnr_graycsf_lh,group = bblid,color = ID,alpha = alpha,size = size)) +  geom_line(aes(x = scanage_years,y = cnr_graycsf_lh,group = bblid,color = ID,alpha = alpha,size = size)) + scale_alpha_identity() + scale_size_identity() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black")) + labs(x = "",y = "") + scale_color_brewer(palette = "Dark2") 
+  cntr <- cntr + 1
+}
+
+CNR.Gray_CSF.poorTemplate <- ggarrange(plotlist = CNR_GrayCSF_lh.plot,common.legend = TRUE,legend = "right",labels = str_c("bblid:",Template.LowCNR.GrayCSF,sep = " "),font.label = list(size = 8),label.x = .5)
+CNR.Gray_CSF.lh.split <- annotate_figure(CNR.Gray_CSF.poorTemplate,bottom = text_grob("Age"),left = text_grob("CNR Gray-CSF Left Hemisphere",rot = 90))
+```
+
+```{r,include=FALSE}
+# Compares the cross-sectional scan trajectory of every individual with a poor template (based on CNR gray-CSF right hemisphere) to individuals with adequate templates
+Template.LowCNR.GrayCSF.rh <- QC.template.included %>% 
+  mutate(Z.cnr_graycsf_rh = as.numeric(scale(cnr_graycsf_rh))) %>% 
+  filter(Z.cnr_graycsf_rh < -2) %>% 
+  arrange(desc(Z.cnr_graycsf_rh)) %>% 
+  pull(bblid)
+
+cntr <- 1
+CNR_GrayCSF_rh.plot <- list()
+for(id in Template.LowCNR.GrayCSF.rh){
+  CNR_GrayCSF_rh.plot[[cntr]] <- QC.long.included %>% 
+    mutate(ID = ifelse(bblid == id,"Poor Template ID","Adequate Template")) %>% 
+    mutate(size = ifelse(bblid == id,.75,.25)) %>% 
+    mutate(alpha = ifelse(bblid == id,1,.1)) %>% 
+    filter(!(bblid %in% Template.LowCNR.GrayCSF.rh) | bblid == id) %>% 
+  ggplot() + geom_point(aes(x = scanage_years,y = cnr_graycsf_rh,group = bblid,color = ID,alpha = alpha,size = size)) +  geom_line(aes(x = scanage_years,y = cnr_graycsf_rh,group = bblid,color = ID,alpha = alpha,size = size)) + scale_alpha_identity() + scale_size_identity() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black")) + labs(x = "",y = "") + scale_color_brewer(palette = "Dark2") 
+  cntr <- cntr + 1
+}
+
+CNR.Gray_CSF.poorTemplate.rh <- ggarrange(plotlist = CNR_GrayCSF_rh.plot,common.legend = TRUE,legend = "right",labels = str_c("bblid:",Template.LowCNR.GrayCSF.rh,sep = " "),font.label = list(size = 8),label.x = .5)
+CNR.Gray_CSF.rh.split <- annotate_figure(CNR.Gray_CSF.poorTemplate.rh,bottom = text_grob("Age"),left = text_grob("CNR Gray-CSF Right Hemisphere",rot = 90))
+```
+
+```{r,include=FALSE}
+# Compares the cross-sectional scan trajectory of every individual with a poor template (based on CNR gray-white left hemisphere) to individuals with adequate templates
+Template.LowCNR.GrayWhite.lh <- QC.template.included %>% 
+  mutate(Z.cnr_graywhite_lh = as.numeric(scale(cnr_graywhite_lh))) %>% 
+  filter(Z.cnr_graywhite_lh < -2) %>% 
+  arrange(desc(Z.cnr_graywhite_lh)) %>% 
+  pull(bblid)
+
+cntr <- 1
+CNR_GrayWhite_lh.plot <- list()
+for(id in Template.LowCNR.GrayWhite.lh){
+  CNR_GrayWhite_lh.plot[[cntr]] <- QC.long.included %>% 
+    mutate(ID = ifelse(bblid == id,"Poor Template ID","Adequate Template")) %>% 
+    mutate(size = ifelse(bblid == id,.75,.25)) %>% 
+    mutate(alpha = ifelse(bblid == id,1,.1)) %>% 
+    filter(!(bblid %in% Template.LowCNR.GrayWhite.lh) | bblid == id) %>% 
+  ggplot() + geom_point(aes(x = scanage_years,y = cnr_graywhite_lh,group = bblid,color = ID,alpha = alpha,size = size)) +  geom_line(aes(x = scanage_years,y = cnr_graywhite_lh,group = bblid,color = ID,alpha = alpha,size = size)) + scale_alpha_identity() + scale_size_identity() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black")) + labs(x = "",y = "") + scale_color_brewer(palette = "Dark2") 
+  cntr <- cntr + 1
+}
+
+CNR.Gray_White.poorTemplate.lh <- ggarrange(plotlist = CNR_GrayWhite_lh.plot,common.legend = TRUE,legend = "right",labels = str_c("bblid:",Template.LowCNR.GrayWhite.lh,sep = " "),font.label = list(size = 8),label.x = .5)
+CNR.Gray_White.lh.split <- annotate_figure(CNR.Gray_White.poorTemplate.lh,bottom = text_grob("Age"),left = text_grob("CNR Gray-White Left Hemisphere",rot = 90))
+
+Bad.template.cnr.graywhite.lh <- QC.template.included %>% 
+  mutate(Z.score = as.numeric(scale(cnr_graywhite_lh))) %>% 
+  filter(Z.score < -2) %>% 
+  pull(bblid)
+
+CNR_graywhite_lh_all_plot <- QC.long.included %>% 
+  mutate(Temp.quality = ifelse(bblid %in% Bad.template.cnr.graywhite.lh,"Poor Template","Adequate Template")) %>% 
+  mutate(alpha = ifelse(Temp.quality == "Poor Template",1,.25)) %>% 
+  mutate(size = ifelse(Temp.quality == "Poor Template",.75,.25)) %>% 
+  ggplot() + geom_point(aes(x = scanage_years,y = cnr_graywhite_lh,group = bblid,color = Temp.quality,alpha = alpha,size = size)) +  geom_line(aes(x = scanage_years,y = cnr_graywhite_lh,group = bblid,color = Temp.quality,alpha = alpha,size = size)) + scale_alpha_identity() + scale_size_identity() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black")) + labs(x = "Age",y = "CNR Gray-White Left Hemisphere",color = "Template quality") + scale_color_brewer(palette = "Dark2")
+```
+
+```{r,include=FALSE}
+# Compares the cross-sectional scan trajectory of every individual with a poor template (based on CNR gray-white right hemisphere) to individuals with adequate templates
+Template.LowCNR.GrayWhite.rh <- QC.template.included %>% 
+  mutate(Z.cnr_graywhite_rh = as.numeric(scale(cnr_graywhite_rh))) %>% 
+  filter(Z.cnr_graywhite_rh < -2) %>% 
+  arrange(desc(Z.cnr_graywhite_rh)) %>% 
+  pull(bblid)
+
+cntr <- 1
+CNR_GrayWhite_rh.plot <- list()
+for(id in Template.LowCNR.GrayWhite.rh){
+  CNR_GrayWhite_rh.plot[[cntr]] <- QC.long.included %>% 
+    mutate(ID = ifelse(bblid == id,"Poor Template ID","Adequate Template")) %>% 
+    mutate(size = ifelse(bblid == id,.75,.25)) %>% 
+    mutate(alpha = ifelse(bblid == id,1,.1)) %>% 
+    filter(!(bblid %in% Template.LowCNR.GrayWhite.rh) | bblid == id) %>% 
+    ggplot() + geom_point(aes(x = scanage_years,y = cnr_graywhite_rh,group = bblid,color = ID,alpha = alpha,size = size)) +  geom_line(aes(x = scanage_years,y = cnr_graywhite_rh,group = bblid,color = ID,alpha = alpha,size = size)) + scale_alpha_identity() + scale_size_identity() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black")) + labs(x = "",y = "") + scale_color_brewer(palette = "Dark2") 
+  cntr <- cntr + 1
+}
+
+CNR.Gray_White.poorTemplate.rh <- ggarrange(plotlist = CNR_GrayWhite_rh.plot,common.legend = TRUE,legend = "right",labels = str_c("bblid:",Template.LowCNR.GrayWhite.rh,sep = " "),font.label = list(size = 8),label.x = .5)
+CNR.Gray_White.rh.split <- annotate_figure(CNR.Gray_White.poorTemplate.rh,bottom = text_grob("Age"),left = text_grob("CNR Gray-White Right Hemisphere",rot = 90))
+
+Bad.template.cnr.graywhite.rh <- QC.template.included %>% 
+  mutate(Z.score = as.numeric(scale(cnr_graywhite_rh))) %>% 
+  filter(Z.score < -2) %>% 
+  pull(bblid)
+
+CNR_graywhite_rh_all_plot <- QC.long.included %>% 
+  mutate(Temp.quality = ifelse(bblid %in% Bad.template.cnr.graywhite.rh,"Poor Template","Adequate Template")) %>% 
+  mutate(alpha = ifelse(Temp.quality == "Poor Template",1,.25)) %>% 
+  mutate(size = ifelse(Temp.quality == "Poor Template",.75,.25)) %>% 
+  ggplot() + geom_point(aes(x = scanage_years,y = cnr_graywhite_rh,group = bblid,color = Temp.quality,alpha = alpha,size = size)) +  geom_line(aes(x = scanage_years,y = cnr_graywhite_rh,group = bblid,color = Temp.quality,alpha = alpha,size = size)) + scale_alpha_identity() + scale_size_identity() + theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(),axis.line = element_line(color = "black")) + labs(x = "Age",y = "CNR Gray-White Right Hemisphere",color = "Template quality") + scale_color_brewer(palette = "Dark2")
+```
+
+```{r,include=FALSE}
+# Creates histogram plot which compares adequate templates to poor templates on their cross-sectional scans
+QC.template.included.quality <- QC.template.included %>% 
+  select(-seslabel,-holes_lh,-holes_rh,-holes_total) %>% 
+  pivot_longer(cols = cnr_graycsf_lh:euler_total,names_to = "QC.measures",values_to = "QC.values") %>% 
+  group_by(QC.measures) %>% 
+  mutate(Z.score = as.vector(scale(QC.values))) %>% 
+  ungroup() %>% 
+  mutate(TemplateQuality = ifelse(Z.score < -2,"Poor (Z < -2)","Adequate (Z > -2)")) %>% 
+  select(bblid,QC.measures,TemplateQuality) 
+
+QC.poor.quality <- QC.long.included %>% 
+  select(-holes_lh,-holes_rh,-holes_total) %>% 
+  pivot_longer(cols = euler_lh:cnr_graywhite_rh,names_to = "QC.measures",values_to = "QC.values") %>% 
+  left_join(QC.template.included.quality) %>% 
+  mutate(TemplateQuality = factor(TemplateQuality,levels = c("Adequate (Z > -2)","Poor (Z < -2)"))) %>% 
+  mutate(QC.measures = case_when(QC.measures == "cnr_graycsf_lh" ~ "CNR Gray-CSF Left Hemisphere",QC.measures == "cnr_graycsf_rh" ~ "CNR Gray-CSF Right Hemisphere",QC.measures == "cnr_graywhite_lh" ~ "CNR Gray-White Left Hemisphere",QC.measures == "cnr_graywhite_rh" ~ "CNR Gray-White Right Hemisphere",QC.measures == "euler_lh" ~ "Euler Left Hemisphere",QC.measures == "euler_rh" ~ "Euler Right Hemisphere",QC.measures == "euler_total" ~ "Euler Total")) %>% 
+  ggplot(aes(x = QC.values,color = TemplateQuality,fill = TemplateQuality)) + geom_histogram(bins = 75) + facet_wrap(~QC.measures,scales = "free_x") + scale_color_brewer(palette = "Dark2") + scale_fill_brewer(palette = "Dark2") + theme_classic() + labs(x = "",fill = "Template Quality",color = "Template Quality")
+```
+
+```{r,include = FALSE}
+# Plots CNR vs Euler to locate individuals who have poor templates on both measures 
+QC.Badtemplates <- QC.template.included.quality %>% 
+  group_by(bblid) %>% 
+  filter(TemplateQuality == "Poor (Z < -2)") %>% 
+  mutate(BadTemplates = str_c(QC.measures,collapse = ",")) %>% 
+  ungroup() %>% 
+  distinct(bblid,.keep_all = TRUE) %>% 
+  select(bblid,BadTemplates)
+
+CNRtoEuler <- QC.template.included %>% 
+  #mutate(across(.cols = matches("cnr|euler"),~as.numeric(scale(.x)))) %>% 
+  mutate(cnr_total = (cnr_graycsf_lh+cnr_graycsf_rh+cnr_graywhite_lh+cnr_graywhite_rh)/4) %>% 
+  left_join(QC.Badtemplates) %>% 
+  ggplot(aes(x = cnr_total,y = euler_total)) + geom_point(aes(text = paste("bblid:",bblid,"\n Poor templates:",BadTemplates)),color = "darkslateblue") + geom_smooth(color = "darkslateblue") + labs(x = "CNR (average)",y = "Euler Total") + theme_minimal()
+
+CNRtoEulerPlot <- ggplotly(CNRtoEuler,tooltip = "text") 
+```
+
+```{r,include=FALSE}
+# Plots variability in CNR vs variability in Euler to find individuals who have poor templates on both measures 
+SD.CNRtoEuler.summary <- QC.long.included %>% 
+  mutate(cnr_total = (cnr_graycsf_lh + cnr_graycsf_rh + cnr_graywhite_lh + cnr_graywhite_rh)/4) %>% 
+  group_by(bblid) %>% 
+  summarize(SD.Euler = sd(euler_total),SD.CNR = sd(cnr_total)) %>% 
+  ungroup() %>% 
+  summarize(Euler.mean = mean(SD.Euler,na.rm = TRUE),Euler.sd = sd(SD.Euler,na.rm = TRUE),CNR.mean = mean(SD.CNR,na.rm = TRUE),CNR.sd = sd(SD.CNR,na.rm = TRUE))
+
+
+SD.CNRtoEuler <- QC.long.included %>% 
+  mutate(cnr_total = (cnr_graycsf_lh + cnr_graycsf_rh + cnr_graywhite_lh + cnr_graywhite_rh)/4) %>% 
+  group_by(bblid) %>% 
+  summarize(SD.Euler = sd(euler_total),SD.CNR = sd(cnr_total)) %>% 
+  left_join(QC.Badtemplates) %>% 
+  ggplot(aes(x = SD.CNR,y = SD.Euler)) + geom_point(aes(text = paste("bblid:",bblid,"\n Poor Templates:",BadTemplates)),color = "darkslateblue",size = .5) + geom_smooth(color = "darkslateblue") + theme_minimal() + labs(x = "CNR variation (SD)",y = "Euler Total variation (SD)") + geom_vline(data = SD.CNRtoEuler.summary,aes(xintercept = CNR.mean + 2*CNR.sd),lty = 2)  + geom_hline(data = SD.CNRtoEuler.summary,aes(yintercept = Euler.mean + 2*Euler.sd),lty = 2) 
+
+SD.CNRtoEulerPlot <- ggplotly(SD.CNRtoEuler,tooltip = "text")
+```
+
+```{r,include=FALSE}
+#length(unique(Exclude.df$bblid))
+#nrow(Exclude.df)
+#aggr(demo,numbers = TRUE,prop = FALSE,cex.axis = .8,oma = c(10,5,5,3))
+
+# We started with 821 subjects, imaged over a total of 2,341 sessions. Due to poor image quality on the cross-sectional sessions, 85 sessions were excluded from further analysis. Furthermore, there are four subjects who don't have stats files for their ses-PNC1 session, so there are 88 sessions which have been removed from the original data set (since one session that didn't have a stats file was also excluded due to poor cross sectional image quality). At this stage, 801 individuals remain in the analysis. Also, there are 48 session which have missing data for race, ethnicity, and/or family id. 
+
+# Filter down dataset so we have one row per subject (scanage_years is age at first scan date for each individual)
+QC.long.included.demo <- QC.long.included %>%
+  group_by(bblid) %>% 
+  arrange(Scan.Date) %>%
+  ungroup() %>% 
+  distinct(bblid,.keep_all = TRUE) %>% 
+  select(bblid,sex:ethnicity,scanage_years) %>% 
+  rename(Age.FirstScan = scanage_years)
+
+# Create demographic table for presentation
+demo.table <- QC.long.included.demo %>% 
+  select(-bblid) %>% 
+  rename(Sex = sex,Race = race,Ethnicity = ethnicity, "Age at first scan" = Age.FirstScan) %>% 
+  tbl_summary() %>% 
+  modify_header(label ~ "**Variable**") %>% 
+  modify_caption("**Subject demographics**") %>% 
+  bold_labels() 
+```
+
+```{r,include = FALSE}
+# Examine histogram and scatter plot of cross-sectional euler total PRIOR to Ellyn's cross-sectional QC to decide on a new cutoff for the cross-sectional data. 
+Cross.hist <- QC.long %>% 
+  pivot_longer(cols = euler_lh:cnr_graywhite_rh,names_to = "Metric",values_to = "Value") %>% 
+  filter(!(Metric %in% c("holes_lh","holes_rh","holes_total"))) %>% 
+  mutate(Metric = case_when(Metric == "cnr_graycsf_lh" ~ "CNR Gray-CSF Left Hemisphere",Metric == "cnr_graycsf_rh" ~ "CNR Gray-CSF Right Hemisphere",Metric == "cnr_graywhite_lh" ~ "CNR Gray-White Left Hemisphere",Metric == "cnr_graywhite_rh" ~ "CNR Gray-White Right Hemisphere",Metric == "euler_lh" ~ "Euler Left Hemisphere",Metric == "euler_rh" ~ "Euler Right Hemisphere",Metric == "euler_total" ~ "Euler Total")) %>% 
+  ggplot(aes(x = Value,color = Metric,fill = Metric)) + geom_histogram(bins = 50) + facet_wrap(~Metric,scales = "free_x") + scale_color_brewer(palette = "Paired") + scale_fill_brewer(palette = "Paired") + theme_minimal() + scale_x_continuous(n.breaks = 4)
+
+Cross.summary <- QC.long %>% 
+  pivot_longer(cols = euler_lh:cnr_graywhite_rh,names_to = "Metric",values_to = "Value") %>% 
+  filter(!(Metric %in% c("holes_lh","holes_rh","holes_total"))) %>% 
+  mutate(Metric = case_when(Metric == "cnr_graycsf_lh" ~ "CNR Gray-CSF Left Hemisphere",Metric == "cnr_graycsf_rh" ~ "CNR Gray-CSF Right Hemisphere",Metric == "cnr_graywhite_lh" ~ "CNR Gray-White Left Hemisphere",Metric == "cnr_graywhite_rh" ~ "CNR Gray-White Right Hemisphere",Metric == "euler_lh" ~ "Euler Left Hemisphere",Metric == "euler_rh" ~ "Euler Right Hemisphere",Metric == "euler_total" ~ "Euler Total")) %>% 
+  group_by(Metric) %>% 
+  summarize(Avg = mean(Value),SD = sd(Value))
+
+theme_set(theme_classic())
+
+Cross.scatter <- QC.long %>% 
+  pivot_longer(cols = euler_lh:cnr_graywhite_rh,names_to = "Metric",values_to = "Value") %>% 
+  filter(!(Metric %in% c("holes_lh","holes_rh","holes_total"))) %>%
+  mutate(Metric = case_when(Metric == "cnr_graycsf_lh" ~ "CNR Gray-CSF Left Hemisphere",Metric == "cnr_graycsf_rh" ~ "CNR Gray-CSF Right Hemisphere",Metric == "cnr_graywhite_lh" ~ "CNR Gray-White Left Hemisphere",Metric == "cnr_graywhite_rh" ~ "CNR Gray-White Right Hemisphere",Metric == "euler_lh" ~ "Euler Left Hemisphere",Metric == "euler_rh" ~ "Euler Right Hemisphere",Metric == "euler_total" ~ "Euler Total")) %>%
+  ggplot(aes(x = Value,y = bblid,color = Metric)) + geom_point(size = .3) + scale_color_brewer(palette = "Paired") + facet_wrap(~Metric,scales = "free") + theme(axis.text.y = element_blank(),axis.ticks.y = element_blank()) + geom_vline(data = Cross.summary,aes(xintercept =Avg),lty = 1) + geom_vline(data = Cross.summary,aes(xintercept = Avg - 2*SD),lty = 2) + geom_vline(data = Cross.summary,aes(xintercept = Avg + 2*SD),lty = 2)
+```
+
+```{r,include = FALSE}
+# Examine whether euler total varies systematically across study 
+Euler.summary <- QC.long %>% 
+  summarize(Mean = mean(euler_total),sd = sd(euler_total))
+
+theme_set(theme_classic())
+
+EulerByStudy <- QC.long %>% 
+  mutate(Session = ifelse(str_detect(Session,pattern = "ses-[[:digit:]]"),str_replace_all(Session,pattern = "ses-",replacement = "ses-GRMPY"),Session)) %>% 
+  mutate(Session = ifelse(Session == "ses-motive1","ses-Motive1",Session)) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "ses-")) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "[[:digit:]]")) %>% 
+  mutate(Session.split = case_when(Session %in% c("AGGY","CONTE","DAY","FNDM") ~ "First",Session %in% c("GRMPY","Motive","NEFF","NODRA") ~ "Second",Session %in% c("ONM","PNC","SYRP") ~ "Third")) %>% 
+  ggplot(aes(x = euler_total,color = Session,fill = Session)) + geom_density(alpha = 0) + scale_fill_manual(values = c("#A6CEE3","#1F78B4","#B2DF8A","#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6","#6A3D9A","#B15928")) + scale_color_manual(values = c("#A6CEE3","#1F78B4","#B2DF8A","#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6","#6A3D9A","#B15928")) + labs(x = "Euler Total",color = "Study",fill = "Study") + theme(strip.text = element_blank(),strip.background = element_blank()) + geom_vline(data = Euler.summary,aes(xintercept = Mean - 2*sd),lty = 2)
+
+prop.removed.plot <- function(cutoff){
+  QC.long %>% 
+    mutate(Session = ifelse(str_detect(Session,pattern = "ses-[[:digit:]]"),str_replace_all(Session,pattern = "ses-",replacement = "ses-GRMPY"),Session)) %>% 
+    mutate(Session = ifelse(Session == "ses-motive1","ses-Motive1",Session)) %>% 
+    mutate(Session = str_remove_all(Session,pattern = "ses-")) %>% 
+    mutate(Session = str_remove_all(Session,pattern = "[[:digit:]]")) %>% 
+    mutate(euler.z = as.numeric(scale(euler_total))) %>% 
+    group_by(Session) %>% 
+    summarize(Proportion.removed = sum(euler.z < -cutoff)/n()) %>% 
+    ggplot(aes(x = Session,color = Session,fill = Session,y = 100*Proportion.removed)) + geom_bar(stat = "identity") + labs(x = "Study",y = "Removed (%)",caption = paste0("Cutoff: ",cutoff,"sd"),color = "Study",fill = "Study") + theme_classic() + scale_color_manual(values = c("#A6CEE3","#1F78B4","#B2DF8A","#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6","#6A3D9A","#B15928")) + scale_fill_manual(values = c("#A6CEE3","#1F78B4","#B2DF8A","#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6","#6A3D9A","#B15928")) 
+}
+```
+
+```{r,include = FALSE}
+Euler.summary.bySession <- QC.long %>% 
+  mutate(Session = ifelse(str_detect(Session,pattern = "ses-[[:digit:]]"),str_replace_all(Session,pattern = "ses-",replacement = "ses-GRMPY"),Session)) %>% 
+  mutate(Session = ifelse(Session == "ses-motive1","ses-Motive1",Session)) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "ses-")) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "[[:digit:]]")) %>%
+  group_by(Session) %>% 
+  summarize(Mean = mean(euler_total),sd = sd(euler_total)) %>% 
+  rename(Study = Session)
+
+
+byStudy.scatter <- QC.long %>% 
+  mutate(Session = ifelse(str_detect(Session,pattern = "ses-[[:digit:]]"),str_replace_all(Session,pattern = "ses-",replacement = "ses-GRMPY"),Session)) %>% 
+  mutate(Session = ifelse(Session == "ses-motive1","ses-Motive1",Session)) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "ses-")) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "[[:digit:]]")) %>% 
+  rename(Study = Session) %>% 
+  ggplot(aes(x = euler_total,y = bblid)) + geom_point(aes(color = Study),size = .75,show.legend = F) + scale_color_manual(values = c("#A6CEE3","#1F78B4","#B2DF8A","#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6","#6A3D9A","#B15928")) + labs(x = "Euler Total") + facet_wrap(~Study,scales = "free_x") + geom_vline(data = Euler.summary.bySession,aes(xintercept = Mean - 2*sd,color = Study),lty = 2,show.legend = F) + geom_vline(data = Euler.summary,aes(xintercept = Mean - 2*sd),lty = 2,color = "black") + theme_pubr() + theme(axis.text.y = element_blank(),axis.ticks.y = element_blank())
+```
+
+```{r}
+demo.global.exclude <- QC.long %>% 
+  left_join(demo) %>%
+  mutate(Session = ifelse(str_detect(Session,pattern = "ses-[[:digit:]]"),str_replace_all(Session,pattern = "ses-",replacement = "ses-GRMPY"),Session)) %>% 
+  mutate(Session = ifelse(Session == "ses-motive1","ses-Motive1",Session)) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "ses-")) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "[[:digit:]]")) %>%
+  rename(Study = Session) %>%
+  mutate(Global.cutoff = as.numeric(Euler.summary$Mean - 2*Euler.summary$sd)) %>% 
+  left_join(Euler.summary.bySession) %>% 
+  mutate(byStudy.cutoff = Mean - 2*sd) %>% 
+  mutate(Global.exclude = ifelse(euler_total < Global.cutoff,"Exclude","Include")) %>% 
+  mutate(byStudy.exclude = ifelse(euler_total < byStudy.cutoff,"Exclude","Include")) %>% 
+  select(sex,race,ethnicity,scanage_years,Global.exclude) %>% 
+  tbl_summary(by = Global.exclude,label = list("sex" ~ "Sex","race" ~ "Race","ethnicity" ~ "Ethnicity","scanage_years" ~ "Age")) %>% 
+  add_p()
+
+demo.study.exclude <- QC.long %>% 
+  left_join(demo) %>%
+  mutate(Session = ifelse(str_detect(Session,pattern = "ses-[[:digit:]]"),str_replace_all(Session,pattern = "ses-",replacement = "ses-GRMPY"),Session)) %>% 
+  mutate(Session = ifelse(Session == "ses-motive1","ses-Motive1",Session)) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "ses-")) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "[[:digit:]]")) %>%
+  rename(Study = Session) %>%
+  mutate(Global.cutoff = as.numeric(Euler.summary$Mean - 2*Euler.summary$sd)) %>% 
+  left_join(Euler.summary.bySession) %>% 
+  mutate(byStudy.cutoff = Mean - 2*sd) %>% 
+  mutate(Global.exclude = ifelse(euler_total < Global.cutoff,"Exclude","Include")) %>% 
+  mutate(byStudy.exclude = ifelse(euler_total < byStudy.cutoff,"Exclude","Include")) %>% 
+  select(sex,race,ethnicity,scanage_years,byStudy.exclude) %>% 
+  tbl_summary(by = byStudy.exclude,label = list("sex" ~ "Sex","race" ~ "Race","ethnicity" ~ "Ethnicity","scanage_years" ~ "Age")) %>% 
+  add_p()
+
+demo.exclude <- tbl_merge(tbls = list(demo.global.exclude,demo.study.exclude),tab_spanner = c("**Global Cutoff**","**By Study Cutoff**"))
+```
+
+
+
+```{r,include = FALSE}
+# Create data set of all individuals who had two scans within six months of one another (also includes rows for individuals who had multiple within-six-months-scans episodes)
+QC.long.byID <- QC.long %>% 
+  group_split(bblid)
+
+WithinSix <- function(df){
+df.ordered <-  df %>% 
+    arrange(Scan.Date)
+dist.mat <- as.matrix(dist(df.ordered$Scan.Date))
+keep <- list()
+keep.cntr <- 1
+for(i in 1:(nrow(df.ordered) - 1)){
+  if(nrow(df.ordered) < 2){
+    break
+  } else if(i %in% unlist(keep) | any(is.na(df.ordered$Scan.Date)) | dist.mat[(i+1),i] > 182){
+    next
+  } else{
+    #keep[[keep.cntr]] <- as.numeric(names(dist.mat[i:nrow(dist.mat),i][dist.mat[i:nrow(dist.mat),i] < 183]))
+    keep[[keep.cntr]] <- c(i,i+1)
+    keep.cntr <- keep.cntr + 1
+    }
+}
+
+df.withinSixMonths <- list()
+for(k in 1:length(keep)){
+  if(length(keep) == 0){
+    break
+  } else{
+df.withinSixMonths[[k]] <- df.ordered %>% 
+  slice(keep[[k]]) %>% 
+  mutate(keep.num = k)
+  }
+}
+df.withinSixMonths <- bind_rows(df.withinSixMonths)
+
+return(df.withinSixMonths)
+}
+
+QC.long.close <- map_dfr(QC.long.byID,WithinSix)
+```
+
+```{r,include = FALSE}
+# Filter aseg cross-sectional data set to include only scans with a 'partner scan' within six months. Plot whether the difference in Euler total between the scans impacts measures of interest such as cortical volume
+asegCross.close <- asegCross.df %>% 
+  separate(Measure.volume,into = c("bblid","Session"),sep = "/") %>% 
+  mutate(bblid = str_remove_all(bblid,pattern = "sub-")) %>% 
+  left_join(QC.long.close) %>% 
+  filter(!is.na(euler_total))
+
+EulerByCortexCross <- asegCross.close %>% 
+  group_by(bblid,keep.num) %>% 
+  arrange(Scan.Date) %>% 
+  mutate(euler_diff = diff(euler_total),Cortex.diff = diff(CortexVol)/abs(CortexVol[1])*100) %>%  
+  mutate(euler.avg = sum(euler_total)/2) %>% 
+  ungroup() %>% 
+  mutate(Scan.quality = cut_number(euler_total,3,labels = c("Low average euler","Mid average euler","High average euler"))) %>% 
+  ggplot(aes(x = euler_diff,y = Cortex.diff,color = Scan.quality)) + geom_point(size = .5) + geom_smooth() + labs(x = expression(paste(Delta,"Euler Total")),y = expression(paste(Delta,"Cortex volume (%)")),color = "Scan quality") + theme_minimal() + scale_color_brewer(palette = "Dark2")
+```
+
+```{r,include = FALSE}
+# Filter aseg longitudinal data set to include only scans with a 'partner scan' within six months. Plot whether the difference in Euler total between the scans impacts measures of interest such as cortical volume
+asegLong.close <- asegLong.df %>% 
+  separate(`Measure:volume`,into = c("bblid","Session"),sep = "/") %>% 
+  mutate(bblid = str_remove_all(bblid,pattern = "sub-")) %>% 
+  mutate(Session = str_remove_all(Session,pattern = "\\..*")) %>% 
+  left_join(QC.long.close) %>% 
+  filter(!is.na(euler_total)) %>% 
+  group_by(keep.num,bblid) %>% 
+  mutate(num_observations = n()) %>% 
+  relocate(num_observations) %>% 
+  filter(num_observations == 2) %>% 
+  select(-num_observations)
+
+EulerByCortexLong <- asegLong.close %>% 
+  group_by(bblid,keep.num) %>% 
+  arrange(Scan.Date) %>% 
+  mutate(delta.euler = diff(euler_total),delta.CortexVol = diff(CortexVol)/abs(CortexVol[1])*100) %>% 
+  distinct(delta.euler,.keep_all = TRUE) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = delta.euler,y = delta.CortexVol)) + geom_point(color = "slategray") + geom_smooth(color = "slategray") + labs(x = expression(paste(Delta,"Euler")),y = expression(paste(Delta,"Cortex volume (%)")),title = "Longitudinal")  + theme_minimal() + scale_y_continuous(labels = comma)
+
+```
+
+```{r,echo = FALSE,fig.width=14,fig.height=8,warning = FALSE,message = FALSE}
+# Print all the plots that were created earlier in the script
+ggarrange(QCplots[[1]],QCplots[[2]],QCplots[[3]],QCplots[[4]],common.legend = TRUE,legend = "bottom")
+ggarrange(QCplots[[8]],QCplots[[9]],QCplots[[10]],common.legend = TRUE,legend = "bottom")
+QC.AcrossModalityTable
+QC.MaxTimeBetweenScans
+QC.AvgTimeBetweenScans
+QC.timepoints.plot
+QC.age.plot
+QC.VariationWithinIndividual 
+TIV.byTime
+TIV.split.time
+TIV.LastFirst
+Euler.drift
+Euler.FirstLast
+Euler.total.split
+QC.Euler.all.plot
+CNR.Gray_CSF.lh.split
+CNR.Gray_CSF.rh.split
+CNR.Gray_White.lh.split
+CNR_graywhite_lh_all_plot
+CNR.Gray_White.rh.split
+CNR_graywhite_rh_all_plot
+QC.poor.quality
+CNRtoEulerPlot
+SD.CNRtoEulerPlot
+Cross.hist
+Cross.scatter
+EulerByStudy
+prop.removed.plot(2)
+grid.arrange(EulerByCortexCross,EulerByCortexLong)
+byStudy.scatter
+```
+
+
+
+
